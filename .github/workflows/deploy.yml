@@ -1,0 +1,356 @@
+name: Deploy RDS
+run-name: >-
+  ${{
+    github.event_name == 'create' && format('🚀 Release: {0}', github.ref_name) ||
+    github.event_name == 'pull_request' && format('PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title) ||
+    github.event_name == 'workflow_dispatch' && format('Manual: {0} ({1})', github.event.inputs.environment, github.event.inputs.action) ||
+    github.event.head_commit.message
+  }}
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ TEMPLATE MODE: Triggers are commented out to prevent automatic runs.       │
+# │ After setup, uncomment the triggers below to enable CI/CD.                 │
+# │ See README.md "Step 4: Enable CI/CD Workflows" for instructions.           │
+# └─────────────────────────────────────────────────────────────────────────────┘
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options: [dev, qa, prod]
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+  # ─────────────────────────────────────────────────────────────────────────────
+  # UNCOMMENT BELOW TO ENABLE AUTOMATIC DEPLOYMENTS
+  # ─────────────────────────────────────────────────────────────────────────────
+  # push:
+  #   branches: [main, develop, "feature/*", "release/*"]
+  #   paths:
+  #     - 'terraform/**'
+  #     - '.github/workflows/deploy.yml'
+  # pull_request:
+  #   branches: [main, develop]
+  #   paths:
+  #     - 'terraform/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  AWS_REGION: eu-west-1
+  TF_VERSION: '1.10.0'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Detect Environment
+  # ─────────────────────────────────────────────────────────────────────────────
+  detect:
+    name: Detect Environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      env_upper: ${{ steps.env.outputs.env_upper }}
+    steps:
+      - name: Detect Environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            ENV="qa"
+          else
+            ENV="dev"
+          fi
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "env_upper=$(echo ${ENV} | tr '[:lower:]' '[:upper:]')" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Validate & Lint
+  # ─────────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+    needs: detect
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: ./terraform
+
+      - name: Check for sensitive data
+        run: |
+          echo "🔍 Scanning for sensitive data..."
+          if grep -r "AKIA" terraform/ 2>/dev/null; then
+            echo "❌ Found AWS Access Key ID pattern!"
+            exit 1
+          fi
+          if grep -r "aws_secret_access_key\s*=\s*[\"']" terraform/ 2>/dev/null; then
+            echo "❌ Found hardcoded AWS secret!"
+            exit 1
+          fi
+          if grep -r "password\s*=\s*[\"'][^\"']*[\"']" terraform/ 2>/dev/null | grep -v "random_password" | grep -v "#"; then
+            echo "⚠️ Warning: Found potential hardcoded password"
+          fi
+          echo "✅ No sensitive data found"
+
+      - name: Terraform Validate
+        run: terraform init -backend=false && terraform validate
+        working-directory: ./terraform
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Security Scan (Checkov)
+  # ─────────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan (Checkov)
+    runs-on: ubuntu-latest
+    needs: detect
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ./terraform
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: true
+          skip_check: CKV_AWS_354,CKV_AWS_353,CKV2_AWS_60
+
+      - name: Upload SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Terraform Plan (for PRs)
+  # ─────────────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    needs: [detect, validate, security-scan]
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    env:
+      ENV: ${{ needs.detect.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', needs.detect.outputs.env_upper)] }}
+          role-session-name: rds-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Account ID
+        id: aws
+        run: echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Read Config
+        id: config
+        run: |
+          DB_NAME=$(grep 'db_name\s*=' terraform/config.tf | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          COMPANY_NAME=$(grep 'company_name\s*=' terraform/config.tf | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "db_name=${DB_NAME}" >> $GITHUB_OUTPUT
+          echo "company_name=${COMPANY_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=tfstate-${{ steps.config.outputs.company_name }}-${{ env.ENV }}-${{ steps.aws.outputs.account_id }}" \
+            -backend-config="key=rds/${{ steps.config.outputs.db_name }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+        working-directory: ./terraform
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -input=false \
+            -var="environment=${{ env.ENV }}" \
+            2>&1 | tee plan.txt
+        working-directory: ./terraform
+        continue-on-error: true
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n\n... (truncated)' : plan;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Terraform Plan for \`${{ env.ENV }}\`\n\n<details><summary>Show Plan</summary>\n\n\`\`\`terraform\n${truncated}\n\`\`\`\n\n</details>`
+            });
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Deploy Infrastructure
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [detect, validate, security-scan]
+    if: github.event.inputs.action != 'destroy' && github.event_name != 'pull_request'
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ENV: ${{ needs.detect.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', needs.detect.outputs.env_upper)] }}
+          role-session-name: rds-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Account ID
+        id: aws
+        run: echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Read Config
+        id: config
+        run: |
+          DB_NAME=$(grep 'db_name\s*=' terraform/config.tf | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          COMPANY_NAME=$(grep 'company_name\s*=' terraform/config.tf | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "db_name=${DB_NAME}" >> $GITHUB_OUTPUT
+          echo "company_name=${COMPANY_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=tfstate-${{ steps.config.outputs.company_name }}-${{ env.ENV }}-${{ steps.aws.outputs.account_id }}" \
+            -backend-config="key=rds/${{ steps.config.outputs.db_name }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+        working-directory: ./terraform
+
+      - name: Terraform Plan
+        run: |
+          terraform plan -out=tfplan -input=false \
+            -var="environment=${{ env.ENV }}"
+        working-directory: ./terraform
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan
+        working-directory: ./terraform
+
+      - name: Summary
+        run: |
+          echo "### ✅ RDS Instance Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Database:** ${{ steps.config.outputs.db_name }}-${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Destroy Infrastructure
+  # ─────────────────────────────────────────────────────────────────────────────
+  destroy:
+    name: Destroy
+    runs-on: ubuntu-latest
+    needs: detect
+    if: github.event.inputs.action == 'destroy'
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ENV: ${{ needs.detect.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', needs.detect.outputs.env_upper)] }}
+          role-session-name: rds-destroy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Account ID
+        id: aws
+        run: echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Read Config
+        id: config
+        run: |
+          DB_NAME=$(grep 'db_name\s*=' terraform/config.tf | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          COMPANY_NAME=$(grep 'company_name\s*=' terraform/config.tf | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "db_name=${DB_NAME}" >> $GITHUB_OUTPUT
+          echo "company_name=${COMPANY_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=tfstate-${{ steps.config.outputs.company_name }}-${{ env.ENV }}-${{ steps.aws.outputs.account_id }}" \
+            -backend-config="key=rds/${{ steps.config.outputs.db_name }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+        working-directory: ./terraform
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy -auto-approve -input=false \
+            -var="environment=${{ env.ENV }}"
+        working-directory: ./terraform
+
+      - name: Summary
+        run: |
+          echo "### 🗑️ RDS Instance Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Database:** ${{ steps.config.outputs.db_name }}-${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
