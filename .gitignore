@@ -1,0 +1,21 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/tfplan
+terraform/.terraform.lock.hcl
+terraform/backend_override.tf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
