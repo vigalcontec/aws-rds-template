@@ -24,9 +24,9 @@ locals {
   # Engine options:
   # - Provisioned: postgres, mysql, mariadb
   # - Serverless:  aurora-postgresql, aurora-mysql
-  engine         = "aurora-postgresql"   # For serverless, use aurora-postgresql or aurora-mysql
-  engine_version = "16.4"                
-  family         = "aurora-postgresql16" 
+  engine         = "aurora-postgresql" # For serverless, use aurora-postgresql or aurora-mysql
+  engine_version = "16.4"
+  family         = "aurora-postgresql16"
 
   # Database name (created on instance)
   database_name = "appdb"
