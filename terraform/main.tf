@@ -33,15 +33,15 @@ data "aws_region" "current" {}
 
 # Get VPC configuration from SSM (deployed by aws-vpc-network-template)
 data "aws_ssm_parameter" "vpc_id" {
-  name = "${local.vpc_ssm_prefix}/vpc_id"
+  name = "${local.vpc_ssm_prefix}/${local.project_name}/vpc_id"
 }
 
 data "aws_ssm_parameter" "database_subnet_ids" {
-  name = "${local.vpc_ssm_prefix}/database_subnet_ids"
+  name = "${local.vpc_ssm_prefix}/${local.project_name}/database_subnet_ids"
 }
 
 data "aws_ssm_parameter" "database_subnet_group_name" {
-  name = "${local.vpc_ssm_prefix}/database_subnet_group_name"
+  name = "${local.vpc_ssm_prefix}/${local.project_name}/database_subnet_group_name"
 }
 
 # -----------------------------------------------------------------------------
