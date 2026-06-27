@@ -109,7 +109,7 @@ locals {
   # Network Configuration
   # ─────────────────────────────────────────────────────────────────────────────
   # VPC SSM parameter paths (from aws-vpc-network-template)
-  vpc_ssm_prefix = "/${var.environment}/vpc"
+  vpc_ssm_prefix = "/${var.environment}/${local.project_name}/vpc"
 
   # Port (default: 5432 for PostgreSQL, 3306 for MySQL)
   port = 5432
