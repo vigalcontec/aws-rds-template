@@ -19,14 +19,14 @@ locals {
   # RDS Engine Configuration
   # ─────────────────────────────────────────────────────────────────────────────
   # Deployment mode: "provisioned" (traditional RDS) or "serverless" (Aurora Serverless v2)
-  deployment_mode = "provisioned"
+  deployment_mode = "serverless"
 
   # Engine options:
   # - Provisioned: postgres, mysql, mariadb
   # - Serverless:  aurora-postgresql, aurora-mysql
-  engine         = "postgres"   # For serverless, use aurora-postgresql or aurora-mysql
+  engine         = "aurora-postgresql"   # For serverless, use aurora-postgresql or aurora-mysql
   engine_version = "16.3"       # For Aurora Serverless v2: 15.4, 14.9, etc.
-  family         = "postgres16" # For Aurora: aurora-postgresql15, aurora-mysql8.0
+  family         = "aurora-postgresql16" # For Aurora: aurora-postgresql15, aurora-mysql8.0
 
   # Database name (created on instance)
   database_name = "appdb"
